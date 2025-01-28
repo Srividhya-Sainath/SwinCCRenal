@@ -1,6 +1,6 @@
-import yaml
+import os,yaml
 import torch
-torch.set_float32_matmul_precision('medium')
+#torch.set_float32_matmul_precision('medium')
 from torch import nn
 from torch.utils.data import DataLoader, DistributedSampler
 import pandas as pd
@@ -14,6 +14,26 @@ import torch.distributed as dist
 
 from model import SwinTransformerFineTune
 from data import list_of_bags_collate_fn
+
+
+## Iska istamal hoga bhi ya nahi? Koi idea nahi hai
+## dekte hain
+## Added 28-Jan-2025
+def setup_ddp(rank: int, world_size: int, backend: str = "nccl"):
+    """
+    Initialize the process group for DDP.
+    Args:
+        rank (int): Rank of the current process.
+        world_size (int): Total number of processes.
+        backend (str): Backend for distributed training ('nccl' for GPU, 'gloo' for CPU).
+    """
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+## Added 28-Jan-2025
+def cleanup_ddp():
+    """Clean up the process group."""
+    dist.destroy_process_group()
 
 class SwinLightningModule(LightningModule):
     def __init__(self, model, loss_func, train_config):
@@ -50,14 +70,15 @@ class SwinLightningModule(LightningModule):
             weight_decay=float(self.train_config['WEIGHT_DECAY'])
         )
         total_steps = self.train_config['EPOCHS'] * (self.train_config['STEPS_PER_EPOCH'] // self.train_config.get('GRAD_ACCUM', 1))
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=float(self.train_config['BASE_LR']),
-            total_steps=total_steps,
-            pct_start=self.train_config['WARMUP_EPOCHS'] / self.train_config['EPOCHS'],
-            anneal_strategy='cos',
-            final_div_factor=1e4
-        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+        # scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        #     optimizer,
+        #     max_lr=float(self.train_config['BASE_LR']),
+        #     total_steps=total_steps,
+        #     pct_start=self.train_config['WARMUP_EPOCHS'] / self.train_config['EPOCHS'],
+        #     anneal_strategy='cos',
+        #     final_div_factor=1e4
+        # )
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
@@ -90,51 +111,51 @@ def train(
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    #distributed = train_config.get('DISTRIBUTED', False)
-    # if distributed:
-    #     dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+    distributed = train_config.get('DISTRIBUTED', False)
+
+    if distributed:
+        rank = int(os.getenv('RANK', '0'))
+        world_size = int(os.getenv('WORLD_SIZE', '1'))
+        setup_ddp(rank, world_size)
 
     # Initialize W&B logger
     wandb_logger = WandbLogger(project="swin_small_patch4_window7_224_bs4_bag128")
 
-    # Initialize W&B and log the configuration
-    # wandb.init(
-    #     project="swin_small_patch4_window7_224",
-    #     config={
-    #         "epochs": train_config['EPOCHS'],
-    #         "batch_size": train_config['BATCH_SIZE'],
-    #         "valid_batch_size": train_config['VALID_BATCH_SIZE'],
-    #         "base_lr": train_config['BASE_LR'],
-    #         "warmup_lr": train_config['WARMUP_LR'],
-    #         "min_lr": train_config['MIN_LR'],
-    #         "weight_decay": train_config['WEIGHT_DECAY'],
-    #         "model_name": model_config['NAME'],
-    #         "drop_path_rate": model_config.get('DROP_PATH_RATE', 0.3),
-    #         "distributed": train_config.get('DISTRIBUTED', False)
-    #     }
-    # )
     pin_memory = torch.cuda.is_available()
 
-    #train_sampler = DistributedSampler(train_datasets["train"]) if dist.is_initialized() else None
-    #valid_sampler = DistributedSampler(test_datasets["test"], shuffle=False) if dist.is_initialized() else None
+    train_sampler = DistributedSampler(
+        train_datasets["train"],
+        num_replicas= int(os.getenv('WORLD_SIZE', '1')),
+        rank= int(os.getenv('RANK', '0')
+              )) if dist.is_initialized() else None
+    
+    valid_sampler = DistributedSampler(
+        test_datasets["test"],
+        num_replicas= int(os.getenv('WORLD_SIZE', '1')),
+        rank= int(os.getenv('RANK', '0'),
+                  shuffle=False)) if dist.is_initialized() else None
 
     train_dl = DataLoader(
-        train_datasets["train"], 
+        train_datasets["train"],
+        sampler = train_sampler,
         batch_size=train_config['BATCH_SIZE'], 
         collate_fn=list_of_bags_collate_fn,
-        shuffle=True,
+        shuffle=train_sampler is None, ## Shuffle tabi karna hai jab distributed nahi hai, 
+        ## kyunki tabi pata rahega ki saara data use ho raha hai har process mein. 
+        ## Also har epoch mein wohi data split use hoga
         num_workers=train_config['NUM_WORKERS'],
         pin_memory=pin_memory
     )
 
     valid_dl = DataLoader(
-        test_datasets["test"], 
+        test_datasets["test"],
+        sampler=valid_sampler,
         batch_size=train_config['VALID_BATCH_SIZE'], 
         shuffle=False,
         collate_fn=list_of_bags_collate_fn,
         num_workers=train_config['NUM_WORKERS'],
         pin_memory=pin_memory,
-        drop_last=False
+        #drop_last=False # Iski zarurat nahi hai, kyunki hum waise bhi saare patches le rahen hai.
     )
 
     train_config['STEPS_PER_EPOCH'] = len(train_dl)
@@ -151,6 +172,12 @@ def train(
         hidden_dim2=model_config.get('HIDDEN_DIM2', 512),
         dropout_prob=model_config.get('DROP_PATH_RATE', 0.3)
     )
+    if distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[rank],
+            output_device=rank
+        )
 
     lightning_model = SwinLightningModule(
         model=model, 
@@ -159,7 +186,6 @@ def train(
     )
 
     # Set distributed training options
-    distributed = train_config.get('DISTRIBUTED', False)
     devices = torch.cuda.device_count() if distributed else 1
     strategy = 'ddp' if distributed and devices > 1 else 'auto'
 
@@ -173,8 +199,8 @@ def train(
         precision="16-mixed",  # Enables mixed precision
         num_sanity_val_steps=0,  # Disable sanity checks
         val_check_interval=1.0,
-        limit_val_batches=1.0,
-        enable_progress_bar=True,
+        #limit_val_batches=1.0, # Iska kya matlab hai??
+        enable_progress_bar=int(os.getenv('RANK', 0)) == 0,
         callbacks=[
             ModelCheckpoint(monitor='val_loss', dirpath=path, filename='best_valid', save_top_k=1, mode='min'),
             EarlyStopping(monitor='val_loss', patience=train_config['PATIENCE'], mode='min'),
@@ -186,5 +212,6 @@ def train(
     trainer.fit(lightning_model, train_dl, valid_dl)
 
     if distributed:
-        dist.destroy_process_group()
+         cleanup_ddp()
+
     return trainer
