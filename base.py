@@ -28,6 +28,7 @@ def setup_ddp(rank: int, world_size: int, backend: str = "nccl"):
         backend (str): Backend for distributed training ('nccl' for GPU, 'gloo' for CPU).
     """
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    print(f"[RANK {rank}] Process group initialized, World Size: {world_size}")
     torch.cuda.set_device(rank)
 
 ## Added 28-Jan-2025
@@ -47,10 +48,15 @@ class SwinLightningModule(LightningModule):
 
     def training_step(self, batch, batch_idx):
         inputs, labels = batch
+        #inputs, labels = inputs.to(self.device), labels.to(self.device) ## labels list hai. Yeh like error degi
         outputs = self.model(inputs)
         loss = self.loss_func(outputs, labels)
-        # Log learning rate to the progress bar
-        ## Check if Grad Accum is set??
+        ## Added on 29-Jan-2025
+        ## Loss per GPU
+        # gathered_losses = [torch.zeros_like(loss) for _ in range(dist.get_world_size())]
+        # dist.all_gather(gathered_losses, loss)
+        # print(f"[Rank {dist.get_rank()}] Losses across GPUs: {gathered_losses}")
+        ### End of addition
         lr = self.trainer.optimizers[0].param_groups[0]['lr']
         self.log('lr', lr, on_step=True, prog_bar=True, logger=True)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
@@ -108,39 +114,40 @@ def train(
     model_config = config['MODEL']
     train_config = config['TRAIN']
 
+    rank = int(os.getenv('RANK', 0))
+    world_size = int(os.getenv('WORLD_SIZE', 1)) ## defaulting to 0 if I want to work on single GPU
+
+    distributed = world_size > 1 # Agar word_size >1, toh DDP enabled hai, assume karle didi
+    # Return mein mujhe Boolean milage. Agar 1 se zyada hai toh True, nahi toh False
+
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
 
-    distributed = train_config.get('DISTRIBUTED', False)
-
+    print('Distributed:', distributed)
     if distributed:
-        rank = int(os.getenv('RANK', '0'))
-        world_size = int(os.getenv('WORLD_SIZE', '1'))
         setup_ddp(rank, world_size)
 
     # Initialize W&B logger
-    wandb_logger = WandbLogger(project="swin_small_patch4_window7_224_bs4_bag128")
+    wandb_logger = WandbLogger(project=model_config['NAME'])
 
     pin_memory = torch.cuda.is_available()
 
-    train_sampler = DistributedSampler(
-        train_datasets["train"],
-        num_replicas= int(os.getenv('WORLD_SIZE', '1')),
-        rank= int(os.getenv('RANK', '0')
-              )) if dist.is_initialized() else None
+    train_sampler = DistributedSampler(train_datasets["train"], 
+                                       num_replicas=world_size,
+                                       rank=rank) if distributed else None
     
     valid_sampler = DistributedSampler(
         test_datasets["test"],
-        num_replicas= int(os.getenv('WORLD_SIZE', '1')),
-        rank= int(os.getenv('RANK', '0'),
-                  shuffle=False)) if dist.is_initialized() else None
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False) if distributed else None
 
     train_dl = DataLoader(
         train_datasets["train"],
         sampler = train_sampler,
         batch_size=train_config['BATCH_SIZE'], 
         collate_fn=list_of_bags_collate_fn,
-        shuffle=train_sampler is None, ## Shuffle tabi karna hai jab distributed nahi hai, 
+        shuffle=not distributed, ## Shuffle tabi karna hai jab distributed nahi hai, 
         ## kyunki tabi pata rahega ki saara data use ho raha hai har process mein. 
         ## Also har epoch mein wohi data split use hoga
         num_workers=train_config['NUM_WORKERS'],
@@ -171,7 +178,7 @@ def train(
         hidden_dim1=model_config['EMBED_DIM'],
         hidden_dim2=model_config.get('HIDDEN_DIM2', 512),
         dropout_prob=model_config.get('DROP_PATH_RATE', 0.3)
-    )
+    ).to(device)
     if distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -200,7 +207,8 @@ def train(
         num_sanity_val_steps=0,  # Disable sanity checks
         val_check_interval=1.0,
         #limit_val_batches=1.0, # Iska kya matlab hai??
-        enable_progress_bar=int(os.getenv('RANK', 0)) == 0,
+        #enable_progress_bar=int(os.getenv('RANK', 0)) == 0,
+        enable_progress_bar=True,
         callbacks=[
             ModelCheckpoint(monitor='val_loss', dirpath=path, filename='best_valid', save_top_k=1, mode='min'),
             EarlyStopping(monitor='val_loss', patience=train_config['PATIENCE'], mode='min'),
